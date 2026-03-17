@@ -1,0 +1,10 @@
+torch>=2.3.0
+torchvision
+torchaudio
+transformers>=4.45.0
+accelerate>=0.34.0
+sentencepiece
+protobuf
+huggingface_hub
+tensorboard
+numpy
