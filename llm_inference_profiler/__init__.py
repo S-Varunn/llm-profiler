@@ -9,6 +9,16 @@ Outputs a consolidated JSON with three layers of detail:
 """
 
 from .profiler import LLMProfiler
+from .adapters import BaseInferenceAdapter, OpenAICompatibleAdapter, LocalVLLMAdapter
+from .deep_profiling import BaseDeepCollector, NsysCollector, ServerLauncher
 
-__all__ = ["LLMProfiler"]
+__all__ = [
+  "LLMProfiler",
+  "BaseInferenceAdapter",
+  "OpenAICompatibleAdapter",
+  "LocalVLLMAdapter",
+  "BaseDeepCollector",
+  "NsysCollector",
+  "ServerLauncher",
+]
 __version__ = "0.1.0"

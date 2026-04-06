@@ -10,20 +10,18 @@ import tempfile
 import datetime
 import torch
 from torch.profiler import profile, ProfilerActivity, record_function
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from .hooks import LayerHooks
 from .token_tracker import TokenTimingProcessor
 from .memory_tracker import MemoryTracker
 from .event_analyzer import EventAnalyzer
 from .trace_analyzer import TraceAnalyzer
+from .adapters import BaseInferenceAdapter
 from .utils import (
     get_gpu_info,
     get_model_info,
     save_json,
-    safe_json_serialize,
-    us_to_ms,
-    bytes_to_mb,
 )
 
 
@@ -50,8 +48,9 @@ class LLMProfiler:
 
     def __init__(
         self,
-        model: torch.nn.Module,
-        tokenizer: Any,
+        model: Optional[torch.nn.Module] = None,
+        tokenizer: Optional[Any] = None,
+        adapter: Optional[BaseInferenceAdapter] = None,
         top_n: int = 20,
         record_shapes: bool = True,
         profile_memory: bool = True,
@@ -61,8 +60,9 @@ class LLMProfiler:
     ):
         """
         Args:
-            model: HuggingFace causal LM model.
+            model: HuggingFace causal LM model (for in-process profiling).
             tokenizer: HuggingFace tokenizer.
+            adapter: Remote backend adapter (vLLM, Ollama, etc).
             top_n: Number of top items to include in breakdowns.
             record_shapes: Record tensor input shapes (moderate memory cost).
             profile_memory: Track per-operator memory allocations.
@@ -71,8 +71,14 @@ class LLMProfiler:
             with_flops: Estimate FLOPS for supported operators.
             with_modules: Associate operators with nn.Module hierarchy.
         """
+        if adapter is None and (model is None or tokenizer is None):
+            raise ValueError(
+                "Provide either (model + tokenizer) or an adapter."
+            )
+
         self._model = model
         self._tokenizer = tokenizer
+        self._adapter = adapter
         self._top_n = top_n
         self._has_cuda = torch.cuda.is_available()
         self._results: Optional[Dict[str, Any]] = None
@@ -90,8 +96,18 @@ class LLMProfiler:
         self._layer_hooks: Optional[LayerHooks] = None
 
         # Model/GPU metadata (collected once)
-        self._gpu_info = get_gpu_info()
-        self._model_info = get_model_info(model)
+        if self._adapter is None:
+            self._gpu_info = get_gpu_info()
+            self._model_info = get_model_info(model)
+        else:
+            self._gpu_info = {"available": False}
+            self._model_info = {
+                "num_parameters": None,
+                "num_parameters_human": None,
+                "dtype": "remote",
+                "device": "remote",
+                "num_layers": None,
+            }
 
     def generate(
         self,
@@ -120,6 +136,18 @@ class LLMProfiler:
         Returns:
             Generated text string (identical to calling model.generate directly).
         """
+        if self._adapter is not None:
+            return self._generate_with_adapter(
+                prompt=prompt,
+                messages=messages,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                **generate_kwargs,
+            )
+
         # Reset state
         self._results = None
         self._token_tracker.reset()
@@ -274,6 +302,9 @@ class LLMProfiler:
             event_results=event_results,
             trace_results=trace_results,
             trace_path=trace_path,
+            backend_metadata=None,
+            adapter_diagnostics=None,
+            adapter_drilldown=None,
         )
 
         # Cleanup temp trace file
@@ -282,6 +313,70 @@ class LLMProfiler:
             os.rmdir(trace_dir)
         except OSError:
             pass
+
+        return generated_text
+
+    def _generate_with_adapter(
+        self,
+        prompt: Optional[str] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+        max_new_tokens: int = 50,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        **generate_kwargs,
+    ) -> str:
+        """Run generation through a remote adapter and normalize output format."""
+        self._results = None
+
+        adapter_result = self._adapter.generate(
+            prompt=prompt,
+            messages=messages,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            **generate_kwargs,
+        )
+
+        generated_text = adapter_result.get("generated_text", "")
+
+        token_results = adapter_result.get("token_results", {})
+        input_token_count = adapter_result.get("input_token_count") or 0
+        output_token_count = adapter_result.get("output_token_count") or 0
+        tokenization_time_ms = float(adapter_result.get("tokenization_time_ms", 0.0))
+        detokenization_time_ms = float(adapter_result.get("detokenization_time_ms", 0.0))
+        memory_summary = adapter_result.get("memory_summary") or {
+            "available": False,
+            "mode": "remote_api",
+        }
+        layer_breakdown = adapter_result.get("layer_breakdown") or {
+            "summary": {},
+            "per_layer": [],
+        }
+        event_results = adapter_result.get("event_results") or {
+            "diagnostics": {},
+            "drilldown": {},
+        }
+        trace_results = adapter_result.get("trace_results") or {}
+
+        self._results = self._assemble_json(
+            tokenization_time_ms=tokenization_time_ms,
+            detokenization_time_ms=detokenization_time_ms,
+            input_token_count=input_token_count,
+            output_token_count=output_token_count,
+            token_results=token_results,
+            memory_summary=memory_summary,
+            layer_breakdown=layer_breakdown,
+            event_results=event_results,
+            trace_results=trace_results,
+            trace_path="",
+            backend_metadata=self._adapter.metadata(),
+            adapter_diagnostics=adapter_result.get("diagnostics", {}),
+            adapter_drilldown=adapter_result.get("drilldown", {}),
+        )
 
         return generated_text
 
@@ -298,6 +393,9 @@ class LLMProfiler:
         trace_results: Dict[str, Any],
         trace_path: str,
         profiler_failed: bool = False,
+        backend_metadata: Optional[Dict[str, Any]] = None,
+        adapter_diagnostics: Optional[Dict[str, Any]] = None,
+        adapter_drilldown: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Assemble the three-layer JSON output."""
 
@@ -311,14 +409,26 @@ class LLMProfiler:
         # Total wall time includes tokenization + generation + detokenization
         total_wall_ms = tokenization_time_ms + total_gen_ms + detokenization_time_ms
 
+        adapter_diagnostics = adapter_diagnostics or {}
+        adapter_drilldown = adapter_drilldown or {}
+
+        if backend_metadata and backend_metadata.get("model_name"):
+            model_name = backend_metadata.get("model_name")
+        elif self._model is not None and hasattr(self._model, "config"):
+            model_name = getattr(
+                self._model,
+                "name_or_path",
+                getattr(self._model.config, "_name_or_path", "unknown"),
+            )
+        else:
+            model_name = "unknown"
+
         return {
             # =================================================================
             # Metadata
             # =================================================================
             "metadata": {
-                "model_name": getattr(self._model, 'name_or_path',
-                                      getattr(self._model.config, '_name_or_path', 'unknown'))
-                    if hasattr(self._model, 'config') else 'unknown',
+                "model_name": model_name,
                 "device": self._model_info["device"],
                 "gpu": self._gpu_info,
                 "dtype": self._model_info["dtype"],
@@ -328,6 +438,11 @@ class LLMProfiler:
                 "timestamp": datetime.datetime.now().isoformat(),
                 "pytorch_version": torch.__version__,
                 "cuda_version": torch.version.cuda if self._has_cuda else None,
+                "backend": backend_metadata or {
+                    "backend": "local_model",
+                    "adapter": None,
+                    "provider": "huggingface",
+                },
                 "profiler_settings": {
                     "record_shapes": self._record_shapes,
                     "profile_memory": self._profile_memory,
@@ -363,6 +478,7 @@ class LLMProfiler:
             # =================================================================
             "diagnostics": {
                 **event_results.get("diagnostics", {}),
+                **adapter_diagnostics,
                 "per_layer": layer_breakdown.get("per_layer", []),
                 "token_timeline": token_results.get("token_timeline", []),
                 "trace_event_categories": trace_results.get(
@@ -375,6 +491,7 @@ class LLMProfiler:
             # =================================================================
             "drilldown": {
                 **event_results.get("drilldown", {}),
+                **adapter_drilldown,
                 "cuda_kernels": trace_results.get("cuda_kernels", []),
                 "cpu_gpu_gaps": trace_results.get("cpu_gpu_gaps", {}),
                 "gpu_memcpy": trace_results.get("gpu_memcpy", []),
@@ -385,6 +502,20 @@ class LLMProfiler:
     def results(self) -> Optional[Dict[str, Any]]:
         """Return the profiling results dict. None if generate() hasn't been called."""
         return self._results
+
+    def merge_results(self, patch: Dict[str, Any]) -> None:
+        """Shallow-merge top-level result sections (and nested dict sections) into current results."""
+        if self._results is None:
+            raise RuntimeError("No results to merge. Call generate() first.")
+
+        for key, value in patch.items():
+            if (
+                isinstance(value, dict)
+                and isinstance(self._results.get(key), dict)
+            ):
+                self._results[key].update(value)
+            else:
+                self._results[key] = value
 
     def save(self, filepath: str, indent: int = 2) -> None:
         """Save profiling results to a JSON file."""

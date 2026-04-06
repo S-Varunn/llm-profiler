@@ -66,6 +66,107 @@ profiler.summary()
 profiler.save("profile_output.json")
 ```
 
+### API Backends (vLLM, Ollama, OpenAI-compatible)
+
+`LLMProfiler` now supports modular adapters.
+For API-served models, use `OpenAICompatibleAdapter` with the same profiler
+interface.
+
+If your model is running via vLLM (`/v1/chat/completions`), use:
+
+```bash
+# 1) (Optional) install vLLM in your environment
+pip install vllm
+
+# 2) Start vLLM server (example)
+vllm serve Qwen/Qwen3-4B --host 0.0.0.0 --port 8000
+
+# 3) In another terminal, run API profiler example
+export API_BASE_URL=http://127.0.0.1:8000
+export API_PROVIDER=vllm
+# Optional model override if multiple models are served
+# export MODEL_NAME=Qwen/Qwen3-4B
+
+python example_vllm_api_profile.py
+```
+
+For Ollama OpenAI-compatible mode:
+
+```bash
+export API_BASE_URL=http://127.0.0.1:11434/v1
+export API_PROVIDER=ollama
+# Optional model override
+# export MODEL_NAME=llama3.1:8b
+
+python example_vllm_api_profile.py
+```
+
+For deep under-the-hood profiling on vLLM (CUDA kernels, CUDA API traces),
+run in hybrid mode and launch vLLM under Nsight Systems:
+
+```bash
+# Requires Nsight Systems (nsys) installed and on PATH
+export PROFILE_MODE=hybrid
+export API_BASE_URL=http://127.0.0.1:8000
+export API_PROVIDER=vllm
+export VLLM_SERVER_CMD="vllm serve Qwen/Qwen3-4B --host 127.0.0.1 --port 8000"
+export DEEP_COLLECTOR=nsys
+
+python example_vllm_api_profile.py
+```
+
+Hybrid mode output includes:
+- regular profiler summary/diagnostics/drilldown from API timing
+- `drilldown.external_profiler` with generated `nsys` artifact paths
+- server log path for troubleshooting startup/profiling issues
+
+### Same-Machine Wrapped vLLM (No Remote Adapter Flow)
+
+If you want to run vLLM and profiling in the same machine/process path,
+use the profiled wrapper server:
+
+```bash
+export MODEL_NAME=Qwen/Qwen3-4B
+export HOST=0.0.0.0
+export PORT=9000
+python profiled_vllm_server.py
+```
+
+Then send requests to the wrapper endpoint:
+
+```bash
+curl -s http://127.0.0.1:9000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen/Qwen3-4B",
+        "messages": [{"role":"user","content":"Explain transformers in one sentence."}],
+        "max_tokens": 64,
+        "temperature": 0.0
+    }'
+```
+
+For each request, the wrapper:
+1. runs generation through local vLLM adapter
+2. profiles execution with torch profiler + trace analyzers
+3. saves per-request JSON under `profiled_requests/`
+4. returns model response and profile path in the API response
+
+You can fetch raw profile JSON back via:
+
+```bash
+curl -s http://127.0.0.1:9000/profiles/<request_id>
+```
+
+This creates `vllm_profile_output.json` with:
+- TTFT (time to first streamed token)
+- ITL percentile stats from streaming chunks
+- End-to-end latency and tokens/sec
+- Optional `/metrics` snapshot from the vLLM server
+
+Note: In-process HuggingFace profiling still provides deep operator/kernel/layer
+analysis. API profiling provides request-level latency/throughput and backend
+metrics from the server process.
+
 ## Usage
 
 ### Basic Profiling

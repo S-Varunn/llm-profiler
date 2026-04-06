@@ -8,3 +8,6 @@ protobuf
 huggingface_hub
 tensorboard
 numpy
+fastapi
+uvicorn
+vllm
