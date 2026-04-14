@@ -157,6 +157,47 @@ You can fetch raw profile JSON back via:
 curl -s http://127.0.0.1:9000/profiles/<request_id>
 ```
 
+For full CUDA-level trace capture, launch the wrapper under Nsight Systems:
+
+```bash
+export MODEL_NAME=Qwen/Qwen3-4B
+export HOST=0.0.0.0
+export PORT=9000
+python run_profiled_vllm_with_nsys.py
+```
+
+This will:
+- start `profiled_vllm_server.py` under `nsys profile`
+- emit `.nsys-rep` files in `deep_profiles/`
+- annotate request phases with NVTX ranges
+- embed collector metadata into each saved request profile JSON
+
+### Use vLLM Built-In Torch Profiler and Still Produce This Repo's JSON
+
+If you start vLLM with internal profiler enabled, you can still use this repo's
+analysis flow by bridging the generated trace files:
+
+```bash
+vllm serve meta-llama/Llama-3-8B \
+    --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_traces"}'
+```
+
+Then run:
+
+```bash
+export VLLM_BASE_URL=http://127.0.0.1:8000
+export VLLM_MODEL=meta-llama/Llama-3-8B
+export VLLM_TRACE_DIR=./vllm_traces
+python example_vllm_internal_torch_profile.py
+```
+
+The script will:
+1. call `/start_profile`
+2. run workload requests via `/v1/chat/completions`
+3. call `/stop_profile`
+4. parse the latest trace (`.json` or `.json.gz`)
+5. save analyzer output to `vllm_internal_torch_profile_output.json`
+
 This creates `vllm_profile_output.json` with:
 - TTFT (time to first streamed token)
 - ITL percentile stats from streaming chunks

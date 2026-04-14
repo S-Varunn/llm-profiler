@@ -25,10 +25,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+import torch
 
 from llm_inference_profiler import LLMProfiler, LocalVLLMAdapter
 
@@ -37,6 +38,9 @@ MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "9000"))
 PROFILE_OUTPUT_DIR = Path(os.getenv("PROFILE_OUTPUT_DIR", "profiled_requests"))
+ENABLE_NVTX = os.getenv("ENABLE_NVTX", "1") == "1"
+EXTERNAL_PROFILER_COLLECTOR = os.getenv("EXTERNAL_PROFILER_COLLECTOR", "none")
+EXTERNAL_PROFILER_OUTPUT_PREFIX = os.getenv("EXTERNAL_PROFILER_OUTPUT_PREFIX", "")
 
 TEMPERATURE_DEFAULT = float(os.getenv("TEMPERATURE", "0.0"))
 MAX_NEW_TOKENS_DEFAULT = int(os.getenv("MAX_NEW_TOKENS", "128"))
@@ -78,6 +82,24 @@ profiler = LLMProfiler(adapter=adapter)
 app = FastAPI(title="Profiled vLLM Wrapper", version="0.1.0")
 
 
+def _nvtx_push(label: str) -> None:
+    if not ENABLE_NVTX or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.nvtx.range_push(label)
+    except Exception:
+        pass
+
+
+def _nvtx_pop() -> None:
+    if not ENABLE_NVTX or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.nvtx.range_pop()
+    except Exception:
+        pass
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
@@ -98,11 +120,12 @@ def models() -> Dict[str, Any]:
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionsRequest) -> JSONResponse:
+def chat_completions(req: ChatCompletionsRequest, request: Request) -> JSONResponse:
     if req.stream:
         raise HTTPException(status_code=400, detail="stream=true not supported in profiled wrapper yet")
 
-    request_id = f"chatcmpl-{uuid.uuid4().hex}"
+    request_id = request.headers.get("x-request-id") or f"chatcmpl-{uuid.uuid4().hex}"
+    request_received_at = time.perf_counter()
 
     temperature = TEMPERATURE_DEFAULT if req.temperature is None else req.temperature
     max_new_tokens = MAX_NEW_TOKENS_DEFAULT if req.max_tokens is None else req.max_tokens
@@ -111,30 +134,96 @@ def chat_completions(req: ChatCompletionsRequest) -> JSONResponse:
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
-    start = time.perf_counter()
+    generate_start = time.perf_counter()
     try:
-        output_text = profiler.generate(
-            messages=messages,
-            max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0.0,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-        )
+        _nvtx_push(f"request:{request_id}")
+        _nvtx_push("request:preprocess")
+        try:
+            output_text = profiler.generate(
+                messages=messages,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0.0,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+        finally:
+            _nvtx_pop()
     except Exception as exc:
+        _nvtx_pop()
         raise HTTPException(status_code=500, detail=f"Generation failed: {exc}")
 
-    elapsed = time.perf_counter() - start
+    generate_end = time.perf_counter()
 
     results = profiler.results() or {}
     profile_path = PROFILE_OUTPUT_DIR / f"{request_id}.json"
+
+    request_lifecycle = {
+        "request_id": request_id,
+        "model": MODEL_NAME,
+        "received_at_ms": 0.0,
+        "generate_start_ms": round((generate_start - request_received_at) * 1000.0, 3),
+        "generate_end_ms": round((generate_end - request_received_at) * 1000.0, 3),
+        "server_overhead_ms": round((generate_start - request_received_at) * 1000.0, 3),
+        "generation_wall_ms": round((generate_end - generate_start) * 1000.0, 3),
+        "response_preparation_ms": 0.0,
+    }
+
+    profiler.merge_results(
+        {
+            "metadata": {
+                "request_id": request_id,
+                "request_received_at": datetime.utcnow().isoformat() + "Z",
+                "external_profiler": {
+                    "collector": EXTERNAL_PROFILER_COLLECTOR,
+                    "output_prefix": EXTERNAL_PROFILER_OUTPUT_PREFIX,
+                    "enabled_nvtx": ENABLE_NVTX,
+                },
+            },
+            "diagnostics": {
+                "request_context": {
+                    "request_id": request_id,
+                    "path": str(request.url.path),
+                    "method": request.method,
+                    "client_host": request.client.host if request.client else None,
+                    "x_request_id": request.headers.get("x-request-id"),
+                },
+                "request_lifecycle": request_lifecycle,
+            },
+            "drilldown": {
+                "request_payload": {
+                    "model": req.model or MODEL_NAME,
+                    "messages": messages,
+                    "max_tokens": max_new_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                }
+            },
+        }
+    )
+    results = profiler.results() or {}
+
+    if EXTERNAL_PROFILER_COLLECTOR != "none" or EXTERNAL_PROFILER_OUTPUT_PREFIX:
+        profiler.merge_results(
+            {
+                "drilldown": {
+                    "external_profiler": {
+                        "collector": EXTERNAL_PROFILER_COLLECTOR,
+                        "output_prefix": EXTERNAL_PROFILER_OUTPUT_PREFIX,
+                    }
+                }
+            }
+        )
+        results = profiler.results() or {}
+
     profiler.save(str(profile_path))
 
     latency = (results.get("summary") or {}).get("latency") or {}
     prompt_tokens = int(latency.get("input_tokens") or 0)
     completion_tokens = int(latency.get("output_tokens") or 0)
 
-    response = {
+    response_body = {
         "id": request_id,
         "object": "chat.completion",
         "created": int(time.time()),
@@ -156,12 +245,21 @@ def chat_completions(req: ChatCompletionsRequest) -> JSONResponse:
         },
         "profiling": {
             "enabled": True,
-            "request_wall_time_ms": round(elapsed * 1000.0, 3),
+            "request_wall_time_ms": round((generate_end - request_received_at) * 1000.0, 3),
             "profile_json": str(profile_path),
+            "request_id": request_id,
+            "external_profiler": {
+                "collector": EXTERNAL_PROFILER_COLLECTOR,
+                "output_prefix": EXTERNAL_PROFILER_OUTPUT_PREFIX,
+            },
         },
     }
 
-    return JSONResponse(content=response)
+    _nvtx_pop()
+
+    json_response = JSONResponse(content=response_body)
+    json_response.headers["x-request-id"] = request_id
+    return json_response
 
 
 @app.get("/profiles/{request_id}")
